@@ -5,9 +5,12 @@ import traceback
 from typing import TypedDict, List, Optional
 
 from flask import Flask, request, render_template_string
+
 from langchain_core.messages import BaseMessage, HumanMessage
 from langchain_core.tools import tool
+
 from langgraph.graph import StateGraph, START, END
+
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
@@ -22,7 +25,7 @@ if not api_key:
 
 
 # =========================================================
-# 2. GEMINI LLM
+# 2. LLM INITIALIZATION
 # =========================================================
 
 llm = ChatGoogleGenerativeAI(
@@ -32,47 +35,34 @@ llm = ChatGoogleGenerativeAI(
 
 
 # =========================================================
-# 3. STATE
+# 3. STATE DEFINITION
 # =========================================================
 
 class CrewState(TypedDict):
+
     messages: List[BaseMessage]
 
     next_step: Optional[str]
 
     code: Optional[str]
 
-    test_cases: Optional[str]
-
     execution_result: Optional[str]
 
-    manager_decision: Optional[str]
+    test_cases: Optional[str]
 
     report: Optional[str]
 
-    # Architecture information
-    task_input: Optional[str]
-    developer_input: Optional[str]
-    developer_output: Optional[str]
-
-    tester_input: Optional[str]
-    tester_output: Optional[str]
-
-    manager_input: Optional[str]
-    manager_output: Optional[str]
-
-    archiver_input: Optional[str]
-    archiver_output: Optional[str]
+    workflow_log: List[str]
 
 
 # =========================================================
-# 4. TOOLS
+# 4. PYTHON CODE EXECUTION TOOL
 # =========================================================
 
 @tool
 def run_python_code(code: str) -> str:
     """
-    Execute Python code and return the output.
+    Execute generated Python code and return output or error.
     """
 
     if not isinstance(code, str):
@@ -85,6 +75,7 @@ def run_python_code(code: str) -> str:
     )
 
     old_stdout = sys.stdout
+
     new_stdout = io.StringIO()
 
     sys.stdout = new_stdout
@@ -106,7 +97,7 @@ def run_python_code(code: str) -> str:
     except Exception:
 
         result = (
-            "Execution Error:\n\n"
+            "Execution Error:\n"
             + traceback.format_exc()
         )
 
@@ -122,38 +113,55 @@ def run_python_code(code: str) -> str:
 
 
 # =========================================================
-# TEST CASE GENERATOR
+# 5. TEST CASE GENERATOR TOOL
 # =========================================================
 
 @tool
 def generate_test_cases(task_description: str) -> str:
     """
-    Generate Python-specific test scenarios.
+    Generate detailed QA test scenarios for a Python coding task.
     """
 
     prompt = f"""
-You are a Senior Python QA Engineer.
+You are a Senior QA Engineer testing a Python program.
 
-Generate 3 to 5 highly specific test scenarios
-for this Python coding task:
-
+Coding Task:
 {task_description}
 
-Requirements:
+Generate 5 highly specific test scenarios.
 
-1. Include normal cases.
-2. Include edge cases.
-3. Include invalid input cases when appropriate.
-4. Include performance cases when appropriate.
-5. All scenarios must be specific to Python.
-6. Do NOT use Java-specific terms such as
-   InvalidArgumentException or BigInt.
-7. Clearly mention:
-   - Input
-   - Expected Output
-   - Objective
+The scenarios MUST include:
 
-Return as a numbered list.
+1. Normal / Standard Case
+2. Boundary / Edge Case
+3. Invalid Input Case
+4. Non-ASCII / Unicode Case when relevant
+5. Extremely Large Input / Performance Case when relevant
+
+For EVERY test case use exactly this style:
+
+### Test Case 1: <title>
+
+**Objective:**
+<what is being verified>
+
+**Input:**
+<specific input>
+
+**Expected Result:**
+<specific expected result>
+
+**Why:**
+<short explanation>
+
+IMPORTANT:
+- The code is Python.
+- Do NOT use Java-specific terms such as InvalidArgumentException,
+  BigInt, NullPointerException, StackOverflowError, etc.
+- Use Python concepts such as ValueError, TypeError,
+  Unicode characters, memory usage, recursion depth, etc.
+- Make the test cases specific to the given task.
+- Do not give generic testing advice.
 """
 
     try:
@@ -175,62 +183,80 @@ Return as a numbered list.
 
     except Exception as e:
 
-        return f"Test generation failed: {str(e)}"
+        return (
+            "Test case generation failed:\n"
+            + str(e)
+        )
 
 
 # =========================================================
-# 5. TASK INPUT AGENT
+# 6. TASK INPUT NODE
 # =========================================================
 
 def task_input_node(state: CrewState):
 
     task = state["messages"][-1].content
 
+    log = state.get("workflow_log", [])
+
+    log.append(
+        "👤 USER\n"
+        "Task received successfully.\n"
+        f"Task: {task}"
+    )
+
     return {
 
-        "task_input": task,
+        "next_step": "developer",
 
-        "developer_input": task,
-
-        "next_step": "developer"
+        "workflow_log": log
     }
 
 
 # =========================================================
-# 6. DEVELOPER AGENT
+# 7. DEVELOPER NODE
 # =========================================================
 
 def real_time_developer(state: CrewState):
 
-    task = state["task_input"]
+    task = state["messages"][-1].content
 
-    prompt = f"""
-You are an expert Python Developer.
+    log = state.get("workflow_log", [])
 
-Solve this coding task:
+    log.append(
+        "👨‍💻 DEVELOPER\n"
+        "Task analyzed successfully.\n"
+        "Generating Python solution..."
+    )
+
+    developer_prompt = f"""
+You are a Senior Python Developer.
+
+Solve the following coding task:
 
 {task}
 
 Requirements:
 
 1. Write clean Python code.
-2. Make the code executable.
-3. Include a useful example execution.
-4. Use print statements where appropriate.
-5. Return ONLY Python code.
-6. Do not return Markdown.
-7. Do not use ```python.
+2. The code must be executable.
+3. Use appropriate functions when useful.
+4. Handle reasonable edge cases.
+5. Include a small example execution using print().
+6. Return ONLY Python code.
+7. Do NOT use Markdown.
+8. Do NOT use ```python.
 """
 
     try:
 
-        response = llm.invoke(prompt)
+        response = llm.invoke(developer_prompt)
 
         content = response.content
 
         if isinstance(content, list):
 
-            code = "\n".join(
+            code_str = "\n".join(
                 item.get("text", str(item))
                 if isinstance(item, dict)
                 else str(item)
@@ -239,148 +265,227 @@ Requirements:
 
         else:
 
-            code = str(content)
+            code_str = str(content)
 
-        code = (
-            code.replace("```python", "")
+        code_str = (
+            code_str
+            .replace("```python", "")
             .replace("```", "")
             .strip()
         )
 
+        log.append(
+            "👨‍💻 DEVELOPER\n"
+            "Python code generated successfully."
+        )
+
         return {
 
-            "code": code,
+            "code": code_str,
 
-            "developer_output": code,
+            "next_step": "tester",
 
-            "tester_input": code,
-
-            "next_step": "tester"
+            "workflow_log": log
         }
 
     except Exception as e:
 
         error_code = (
-            "# Developer Agent Error\n"
-            f"print({str(e)!r})"
+            "print('Developer Error:', "
+            + repr(str(e))
+            + ")"
+        )
+
+        log.append(
+            "❌ DEVELOPER ERROR\n"
+            + str(e)
         )
 
         return {
 
             "code": error_code,
 
-            "developer_output": error_code,
+            "next_step": "tester",
 
-            "tester_input": error_code,
-
-            "next_step": "tester"
+            "workflow_log": log
         }
 
 
 # =========================================================
-# 7. TESTER AGENT
+# 8. TESTER NODE
 # =========================================================
 
 def real_time_tester(state: CrewState):
 
-    task = state["task_input"]
+    task = state["messages"][-1].content
 
     code = state["code"]
 
+    log = state.get("workflow_log", [])
+
+    log.append(
+        "🧪 TESTER\n"
+        "Developer output received.\n"
+        "Generating QA test scenarios..."
+    )
+
+    # -----------------------------------------------------
     # Generate test cases
+    # -----------------------------------------------------
+
     test_cases = generate_test_cases.invoke(task)
 
-    # Execute generated code
+    test_cases = str(test_cases)
+
+    log.append(
+        "🧪 TESTER\n"
+        "5 detailed test scenarios generated."
+    )
+
+    # -----------------------------------------------------
+    # Execute code
+    # -----------------------------------------------------
+
+    log.append(
+        "▶️ EXECUTOR\n"
+        "Running generated Python code..."
+    )
+
     execution_result = run_python_code.invoke(
         {
             "code": code
         }
     )
 
-    tester_output = (
-        "TEST CASES\n\n"
+    log.append(
+        "▶️ EXECUTOR\n"
+        "Code execution completed."
+    )
+
+    # -----------------------------------------------------
+    # Create report
+    # -----------------------------------------------------
+
+    report = (
+
+        "👤 USER\n"
+        "Task received successfully.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "👨‍💻 DEVELOPER\n"
+        "Code generated successfully.\n\n"
+
+        "### GENERATED CODE\n\n"
+        f"{code}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "▶️ EXECUTOR\n"
+        "Generated code executed successfully.\n\n"
+
+        "### EXECUTION OUTPUT\n\n"
+        f"{execution_result}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "🧪 TESTER\n"
+        "QA analysis completed.\n\n"
+
+        "### TEST SCENARIOS\n\n"
         f"{test_cases}\n\n"
-        "EXECUTION RESULT\n\n"
-        f"{execution_result}"
+
     )
 
     return {
 
-        "test_cases": test_cases,
-
         "execution_result": execution_result,
 
-        "tester_output": tester_output,
+        "test_cases": test_cases,
 
-        "manager_input": tester_output,
+        "report": report,
 
-        "next_step": "manager"
+        "next_step": "manager",
+
+        "workflow_log": log
     }
 
 
 # =========================================================
-# 8. MANAGER AGENT
+# 9. MANAGER NODE
 # =========================================================
 
 def manager_decision_node(state: CrewState):
 
-    execution_result = state["execution_result"]
+    log = state.get("workflow_log", [])
 
-    if "Execution Error" in execution_result:
+    log.append(
+        "👨‍💼 MANAGER\n"
+        "Report reviewed successfully.\n"
+        "Decision: Send task to Archiver."
+    )
 
-        decision = (
-            "⚠️ Execution error detected. "
-            "Result archived with error information."
-        )
+    report = state.get("report", "")
 
-    else:
+    report += (
 
-        decision = (
-            "✅ Code execution completed successfully. "
-            "Proceeding to archive the result."
-        )
+        "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-    return {
-
-        "manager_input": (
-            "Tester provided execution result:\n\n"
-            + execution_result
-        ),
-
-        "manager_decision": decision,
-
-        "manager_output": decision,
-
-        "archiver_input": decision,
-
-        "next_step": "archiver"
-    }
-
-
-# =========================================================
-# 9. ARCHIVER AGENT
-# =========================================================
-
-def archiver_node(state: CrewState):
-
-    final_report = (
-        "ARCHIVED SUCCESSFULLY\n\n"
-        "The complete Developer → Tester → Manager "
-        "workflow has been completed."
+        "👨‍💼 MANAGER\n"
+        "Report reviewed successfully.\n"
+        "Decision: Send task to Archiver.\n\n"
     )
 
     return {
 
-        "archiver_output": final_report,
+        "report": report,
 
-        "report": final_report,
+        "next_step": "archiver",
 
-        "next_step": "exit"
+        "workflow_log": log
     }
 
 
 # =========================================================
-# 10. BUILD LANGGRAPH
+# 10. ARCHIVER NODE
+# =========================================================
+
+def archiver_node(state: CrewState):
+
+    log = state.get("workflow_log", [])
+
+    log.append(
+        "🗄️ ARCHIVER\n"
+        "Task stored successfully.\n"
+        "Workflow is closing."
+    )
+
+    report = state.get("report", "")
+
+    report += (
+
+        "🗄️ ARCHIVER\n"
+        "Task stored successfully.\n"
+        "Workflow is closing.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "🏁 END\n"
+        "Workflow completed successfully."
+    )
+
+    return {
+
+        "report": report,
+
+        "next_step": "exit",
+
+        "workflow_log": log
+    }
+
+
+# =========================================================
+# 11. GRAPH CONSTRUCTION
 # =========================================================
 
 workflow = StateGraph(CrewState)
@@ -402,7 +507,7 @@ workflow.add_node(
 )
 
 workflow.add_node(
-    "manager",
+    "manager_decision",
     manager_decision_node
 )
 
@@ -412,7 +517,9 @@ workflow.add_node(
 )
 
 
-# START → TASK INPUT
+# =========================================================
+# 12. GRAPH EDGES
+# =========================================================
 
 workflow.add_edge(
     START,
@@ -420,15 +527,20 @@ workflow.add_edge(
 )
 
 
-# TASK INPUT → DEVELOPER
+def route_from_input(state):
 
-workflow.add_edge(
+    if state.get("next_step") == "exit":
+
+        return END
+
+    return "developer"
+
+
+workflow.add_conditional_edges(
     "task_input",
-    "developer"
+    route_from_input
 )
 
-
-# DEVELOPER → TESTER
 
 workflow.add_edge(
     "developer",
@@ -436,23 +548,26 @@ workflow.add_edge(
 )
 
 
-# TESTER → MANAGER
-
 workflow.add_edge(
     "tester",
-    "manager"
+    "manager_decision"
 )
 
 
-# MANAGER → ARCHIVER
+def route_from_manager(state):
 
-workflow.add_edge(
-    "manager",
-    "archiver"
+    if state.get("next_step") == "archiver":
+
+        return "archiver"
+
+    return "task_input"
+
+
+workflow.add_conditional_edges(
+    "manager_decision",
+    route_from_manager
 )
 
-
-# ARCHIVER → END
 
 workflow.add_edge(
     "archiver",
@@ -460,20 +575,20 @@ workflow.add_edge(
 )
 
 
-# Compile
+# Compile graph
 
 rt_app = workflow.compile()
 
 
 # =========================================================
-# 11. FLASK
+# 13. FLASK APPLICATION
 # =========================================================
 
 app = Flask(__name__)
 
 
 # =========================================================
-# 12. HTML
+# 14. HTML PAGE
 # =========================================================
 
 HTML = """
@@ -484,432 +599,119 @@ HTML = """
 
 <head>
 
-<title>Agentic AI - LangGraph Architecture</title>
-
+<title>LangGraph AI Developer</title>
 
 <style>
 
-
-* {
-    box-sizing: border-box;
-}
-
-
 body {
+
+    font-family: Arial, sans-serif;
+
+    background: #f4f6f8;
 
     margin: 0;
 
-    padding: 30px;
+    padding: 40px;
 
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
-
-    background:
-        linear-gradient(
-            135deg,
-            #eef2ff,
-            #f8fafc
-        );
-
-    color: #1e293b;
 }
-
 
 .container {
 
-    max-width: 1250px;
+    max-width: 1000px;
 
     margin: auto;
-}
-
-
-/* =====================================================
-   HEADER
-   ===================================================== */
-
-.header {
 
     background: white;
 
     padding: 30px;
 
-    border-radius: 20px;
+    border-radius: 15px;
+
+    box-shadow:
+        0 4px 20px
+        rgba(0,0,0,0.12);
+
+}
+
+h1 {
 
     text-align: center;
 
-    box-shadow:
-        0 10px 30px
-        rgba(0,0,0,0.08);
-
-    margin-bottom: 25px;
 }
-
-
-.header h1 {
-
-    margin: 0;
-
-    font-size: 32px;
-}
-
-
-.header p {
-
-    color: #64748b;
-
-    margin-bottom: 0;
-}
-
-
-/* =====================================================
-   INPUT
-   ===================================================== */
-
-.input-card {
-
-    background: white;
-
-    padding: 25px;
-
-    border-radius: 18px;
-
-    box-shadow:
-        0 8px 25px
-        rgba(0,0,0,0.07);
-
-    margin-bottom: 30px;
-}
-
 
 textarea {
 
     width: 100%;
 
-    height: 110px;
+    height: 130px;
 
-    padding: 15px;
-
-    border:
-        2px solid #e2e8f0;
-
-    border-radius: 12px;
+    padding: 14px;
 
     font-size: 16px;
 
-    resize: vertical;
-}
+    box-sizing: border-box;
 
+    border-radius: 8px;
+
+    border: 1px solid #ccc;
+
+}
 
 button {
 
     margin-top: 15px;
 
-    padding:
-        13px 28px;
-
-    border: none;
-
-    border-radius: 10px;
-
-    background:
-        #4f46e5;
-
-    color: white;
+    padding: 13px 28px;
 
     font-size: 16px;
 
-    font-weight: bold;
-
     cursor: pointer;
-}
 
+    border: none;
 
-button:hover {
+    border-radius: 8px;
 
-    background:
-        #4338ca;
-}
-
-
-/* =====================================================
-   ARCHITECTURE
-   ===================================================== */
-
-.architecture-title {
-
-    text-align: center;
-
-    margin:
-        25px 0;
-}
-
-
-.flow {
-
-    display: flex;
-
-    flex-direction: column;
-
-    align-items: center;
-
-    gap: 12px;
-}
-
-
-.agent-card {
-
-    width: 90%;
-
-    background: white;
-
-    border-radius: 18px;
-
-    padding: 22px;
-
-    box-shadow:
-        0 8px 25px
-        rgba(0,0,0,0.08);
-
-    border-left:
-        7px solid #4f46e5;
-
-    transition:
-        transform 0.2s;
-}
-
-
-.agent-card:hover {
-
-    transform:
-        translateY(-3px);
-}
-
-
-.agent-header {
-
-    display: flex;
-
-    justify-content:
-        space-between;
-
-    align-items: center;
-
-    margin-bottom: 15px;
-}
-
-
-.agent-name {
-
-    font-size: 22px;
-
-    font-weight: bold;
-}
-
-
-.agent-number {
-
-    background:
-        #4f46e5;
+    background: #222;
 
     color: white;
 
-    padding:
-        7px 12px;
-
-    border-radius: 20px;
-
-    font-size: 13px;
 }
 
+button:hover {
 
-.io-grid {
+    opacity: 0.85;
 
-    display: grid;
-
-    grid-template-columns:
-        1fr 1fr;
-
-    gap: 15px;
 }
-
-
-.io-box {
-
-    padding: 15px;
-
-    border-radius: 12px;
-
-    background:
-        #f8fafc;
-
-    border:
-        1px solid #e2e8f0;
-}
-
-
-.io-title {
-
-    font-weight: bold;
-
-    margin-bottom: 8px;
-}
-
-
-.io-content {
-
-    white-space: pre-wrap;
-
-    word-break: break-word;
-
-    font-family:
-        Consolas,
-        monospace;
-
-    font-size: 13px;
-
-    max-height: 280px;
-
-    overflow-y: auto;
-}
-
-
-.arrow {
-
-    font-size: 32px;
-
-    color: #4f46e5;
-
-    font-weight: bold;
-}
-
-
-/* =====================================================
-   FINAL RESULT
-   ===================================================== */
-
-.final-result {
-
-    margin-top: 35px;
-
-    background: white;
-
-    padding: 25px;
-
-    border-radius: 18px;
-
-    box-shadow:
-        0 8px 30px
-        rgba(0,0,0,0.1);
-}
-
-
-.final-title {
-
-    font-size: 25px;
-
-    font-weight: bold;
-
-    margin-bottom: 20px;
-}
-
-
-.result-section {
-
-    margin-bottom: 20px;
-
-    padding: 18px;
-
-    background:
-        #f8fafc;
-
-    border-radius: 12px;
-}
-
-
-.result-section h3 {
-
-    margin-top: 0;
-}
-
 
 pre {
 
-    white-space: pre-wrap;
+    background: #f0f2f5;
 
-    word-break: break-word;
-
-    font-family:
-        Consolas,
-        monospace;
-
-    font-size: 14px;
-}
-
-
-/* =====================================================
-   STATUS
-   ===================================================== */
-
-.status {
-
-    text-align: center;
-
-    margin-top: 20px;
-
-    padding: 12px;
-
-    background:
-        #ecfdf5;
-
-    color:
-        #047857;
+    padding: 20px;
 
     border-radius: 10px;
 
-    font-weight: bold;
-}
+    white-space: pre-wrap;
 
+    overflow-x: auto;
 
-/* =====================================================
-   MOBILE
-   ===================================================== */
-
-@media(max-width: 700px) {
-
-    body {
-
-        padding: 15px;
-    }
-
-
-    .agent-card {
-
-        width: 100%;
-    }
-
-
-    .io-grid {
-
-        grid-template-columns:
-            1fr;
-    }
-
-
-    .agent-header {
-
-        flex-direction:
-            column;
-
-        align-items:
-            flex-start;
-
-        gap: 10px;
-    }
+    line-height: 1.5;
 
 }
 
+.workflow {
+
+    background: #fafafa;
+
+    border-left: 5px solid #333;
+
+    padding: 20px;
+
+    margin-top: 20px;
+
+    border-radius: 8px;
+
+}
 
 </style>
 
@@ -922,462 +724,62 @@ pre {
 <div class="container">
 
 
-<!-- ===================================================
-     HEADER
-     =================================================== -->
-
-<div class="header">
-
-    <h1>
-        🤖 Agentic AI Developer System
-    </h1>
-
-    <p>
-        Multi-Agent Workflow powered by
-        LangGraph + Gemini
-    </p>
-
-</div>
+<h1>
+🤖 LangGraph AI Developer
+</h1>
 
 
-<!-- ===================================================
-     USER INPUT
-     =================================================== -->
-
-<div class="input-card">
-
-    <h2>👤 User Task</h2>
-
-    <form method="POST">
-
-        <textarea
-            name="task"
-            placeholder="Example: Write a Python program to check whether a number is prime."
-            required
-        ></textarea>
-
-        <br>
-
-        <button type="submit">
-            🚀 Run Agent Workflow
-        </button>
-
-    </form>
-
-</div>
+<form method="POST">
 
 
-{% if data %}
+<label>
+
+<b>Enter your coding task:</b>
+
+</label>
 
 
-<!-- ===================================================
-     ARCHITECTURE TITLE
-     =================================================== -->
+<br><br>
 
-<h2 class="architecture-title">
 
-    🔗 Agentic AI Architecture & Execution Flow
+<textarea
 
+name="task"
+
+placeholder="Example: Check whether a string is a palindrome."
+
+required
+
+></textarea>
+
+
+<br>
+
+
+<button type="submit">
+
+🚀 Run Agentic Workflow
+
+</button>
+
+
+</form>
+
+
+{% if report %}
+
+
+<hr>
+
+
+<h2>
+Agentic Workflow Result
 </h2>
 
 
-<div class="flow">
+<div class="workflow">
 
-
-<!-- ===================================================
-     USER
-     =================================================== -->
-
-<div class="agent-card">
-
-    <div class="agent-header">
-
-        <div class="agent-name">
-            👤 USER
-        </div>
-
-        <div class="agent-number">
-            INPUT
-        </div>
-
-    </div>
-
-
-    <div class="io-grid">
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📥 Input
-            </div>
-
-            <div class="io-content">
-{{ data.task }}
-            </div>
-
-        </div>
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📤 Output
-            </div>
-
-            <div class="io-content">
-Task sent to Task Input Agent
-            </div>
-
-        </div>
-
-    </div>
-
-</div>
-
-
-<div class="arrow">
-    ↓
-</div>
-
-
-<!-- ===================================================
-     TASK INPUT AGENT
-     =================================================== -->
-
-<div class="agent-card">
-
-    <div class="agent-header">
-
-        <div class="agent-name">
-            🟦 TASK INPUT AGENT
-        </div>
-
-        <div class="agent-number">
-            NODE 1
-        </div>
-
-    </div>
-
-
-    <div class="io-grid">
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📥 Input
-            </div>
-
-            <div class="io-content">
-{{ data.task }}
-            </div>
-
-        </div>
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📤 Output
-            </div>
-
-            <div class="io-content">
-Task prepared and routed to Developer Agent
-            </div>
-
-        </div>
-
-    </div>
-
-</div>
-
-
-<div class="arrow">
-    ↓
-</div>
-
-
-<!-- ===================================================
-     DEVELOPER
-     =================================================== -->
-
-<div class="agent-card">
-
-    <div class="agent-header">
-
-        <div class="agent-name">
-            👨‍💻 DEVELOPER AGENT
-        </div>
-
-        <div class="agent-number">
-            NODE 2
-        </div>
-
-    </div>
-
-
-    <div class="io-grid">
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📥 Input
-            </div>
-
-            <div class="io-content">
-{{ data.task }}
-            </div>
-
-        </div>
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📤 Output — Generated Python Code
-            </div>
-
-            <div class="io-content">{{ data.code }}</div>
-
-        </div>
-
-    </div>
-
-</div>
-
-
-<div class="arrow">
-    ↓
-</div>
-
-
-<!-- ===================================================
-     TESTER
-     =================================================== -->
-
-<div class="agent-card">
-
-    <div class="agent-header">
-
-        <div class="agent-name">
-            🧪 TESTER AGENT
-        </div>
-
-        <div class="agent-number">
-            NODE 3
-        </div>
-
-    </div>
-
-
-    <div class="io-grid">
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📥 Input — Developer Code
-            </div>
-
-            <div class="io-content">{{ data.code }}</div>
-
-        </div>
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📤 Output — Test Results
-            </div>
-
-            <div class="io-content">{{ data.tester_output }}</div>
-
-        </div>
-
-
-    </div>
-
-</div>
-
-
-<div class="arrow">
-    ↓
-</div>
-
-
-<!-- ===================================================
-     MANAGER
-     =================================================== -->
-
-<div class="agent-card">
-
-    <div class="agent-header">
-
-        <div class="agent-name">
-            🧠 MANAGER AGENT
-        </div>
-
-        <div class="agent-number">
-            NODE 4
-        </div>
-
-    </div>
-
-
-    <div class="io-grid">
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📥 Input
-            </div>
-
-            <div class="io-content">
-{{ data.manager_input }}
-            </div>
-
-        </div>
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📤 Decision
-            </div>
-
-            <div class="io-content">
-{{ data.manager_decision }}
-            </div>
-
-        </div>
-
-
-    </div>
-
-</div>
-
-
-<div class="arrow">
-    ↓
-</div>
-
-
-<!-- ===================================================
-     ARCHIVER
-     =================================================== -->
-
-<div class="agent-card">
-
-    <div class="agent-header">
-
-        <div class="agent-name">
-            🗄️ ARCHIVER AGENT
-        </div>
-
-        <div class="agent-number">
-            NODE 5
-        </div>
-
-    </div>
-
-
-    <div class="io-grid">
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📥 Input
-            </div>
-
-            <div class="io-content">
-{{ data.archiver_input }}
-            </div>
-
-        </div>
-
-
-        <div class="io-box">
-
-            <div class="io-title">
-                📤 Output
-            </div>
-
-            <div class="io-content">
-{{ data.archiver_output }}
-            </div>
-
-        </div>
-
-
-    </div>
-
-</div>
-
-
-</div>
-
-
-<!-- ===================================================
-     FINAL RESULT
-     =================================================== -->
-
-<div class="final-result">
-
-
-    <div class="final-title">
-        🏁 FINAL RESULT
-    </div>
-
-
-    <div class="status">
-        ✅ Complete Agent Workflow Executed Successfully
-    </div>
-
-
-    <div class="result-section">
-
-        <h3>
-            💻 Generated Python Code
-        </h3>
-
-        <pre>{{ data.code }}</pre>
-
-    </div>
-
-
-    <div class="result-section">
-
-        <h3>
-            ▶️ Execution Output
-        </h3>
-
-        <pre>{{ data.execution_result }}</pre>
-
-    </div>
-
-
-    <div class="result-section">
-
-        <h3>
-            🧪 QA Test Scenarios
-        </h3>
-
-        <pre>{{ data.test_cases }}</pre>
-
-    </div>
-
-
-    <div class="result-section">
-
-        <h3>
-            🧠 Manager Decision
-        </h3>
-
-        <pre>{{ data.manager_decision }}</pre>
-
-    </div>
-
+<pre>{{ report }}</pre>
 
 </div>
 
@@ -1390,19 +792,24 @@ Task prepared and routed to Developer Agent
 
 </body>
 
+
 </html>
 
 """
 
 
 # =========================================================
-# 13. FLASK ROUTE
+# 15. FLASK ROUTE
 # =========================================================
 
-@app.route("/", methods=["GET", "POST"])
+@app.route(
+    "/",
+    methods=["GET", "POST"]
+)
+
 def home():
 
-    data = None
+    report = None
 
     if request.method == "POST":
 
@@ -1416,150 +823,72 @@ def home():
             try:
 
                 result = rt_app.invoke(
+
                     {
+
                         "messages": [
+
                             HumanMessage(
                                 content=task
                             )
+
                         ],
 
                         "next_step": None,
 
                         "code": None,
 
-                        "test_cases": None,
-
                         "execution_result": None,
 
-                        "manager_decision": None,
+                        "test_cases": None,
 
                         "report": None,
 
-                        "task_input": None,
+                        "workflow_log": []
 
-                        "developer_input": None,
-
-                        "developer_output": None,
-
-                        "tester_input": None,
-
-                        "tester_output": None,
-
-                        "manager_input": None,
-
-                        "manager_output": None,
-
-                        "archiver_input": None,
-
-                        "archiver_output": None
                     }
+
                 )
 
+                report = result.get(
 
-                data = {
+                    "report",
 
-                    "task":
-                        result.get(
-                            "task_input",
-                            task
-                        ),
+                    "No report generated."
 
-                    "code":
-                        result.get(
-                            "code",
-                            "No code generated."
-                        ),
+                )
 
-                    "tester_output":
-                        result.get(
-                            "tester_output",
-                            "No tester output."
-                        ),
+            except Exception:
 
-                    "test_cases":
-                        result.get(
-                            "test_cases",
-                            "No test cases generated."
-                        ),
+                report = (
 
-                    "execution_result":
-                        result.get(
-                            "execution_result",
-                            "No execution result."
-                        ),
+                    "❌ APPLICATION ERROR\n\n"
 
-                    "manager_input":
-                        result.get(
-                            "manager_input",
-                            "No manager input."
-                        ),
+                    + traceback.format_exc()
 
-                    "manager_decision":
-                        result.get(
-                            "manager_decision",
-                            "No manager decision."
-                        ),
-
-                    "archiver_input":
-                        result.get(
-                            "archiver_input",
-                            "No archiver input."
-                        ),
-
-                    "archiver_output":
-                        result.get(
-                            "archiver_output",
-                            "No archiver output."
-                        )
-                }
-
-
-            except Exception as e:
-
-                data = {
-
-                    "task": task,
-
-                    "code":
-                        "Application Error",
-
-                    "tester_output":
-                        traceback.format_exc(),
-
-                    "test_cases":
-                        "",
-
-                    "execution_result":
-                        "",
-
-                    "manager_input":
-                        "",
-
-                    "manager_decision":
-                        "",
-
-                    "archiver_input":
-                        "",
-
-                    "archiver_output":
-                        ""
-                }
-
+                )
 
     return render_template_string(
+
         HTML,
-        data=data
+
+        report=report
+
     )
 
 
 # =========================================================
-# 14. START APPLICATION
+# 16. RUN APPLICATION
 # =========================================================
 
 if __name__ == "__main__":
 
     app.run(
+
         host="0.0.0.0",
+
         port=5000,
+
         debug=False
+
     )
