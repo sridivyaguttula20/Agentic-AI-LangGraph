@@ -1,6 +1,8 @@
+%%writefile requirements.txt
 
 Flask
 langchain-core
 langgraph
 langchain-google-genai
 google-generativeai
+gunicorn
